@@ -1,6 +1,7 @@
 /**
  * Second Brain — Cloudflare Worker
  * https://github.com/rahilp/second-brain-cloudflare
+ * Modified by chithanh85: switched to bge-m3 multilingual model (1024-dim)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -27,6 +28,11 @@ const CORS_HEADERS = {
 const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 const DUPLICATE_FLAG_THRESHOLD = 0.85;
 
+// ─── Embedding Model ──────────────────────────────────────────────────────────
+// Using bge-m3: Multi-Functionality, Multi-Linguality (100+ languages incl. Vietnamese),
+// Multi-Granularity. Produces 1024-dimensional vectors.
+const EMBEDDING_MODEL = "@cf/baai/bge-m3";
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function isAuthorized(request: Request, env: Env): boolean {
@@ -41,7 +47,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 async function embed(text: string, env: Env): Promise<number[]> {
-  const result = (await env.AI.run("@cf/baai/bge-small-en-v1.5" as any, { text: [text] })) as any;
+  const result = (await env.AI.run(EMBEDDING_MODEL as any, { text: [text] })) as any;
   return result.data[0] as number[];
 }
 
@@ -173,7 +179,7 @@ async function appendToEntry(
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
 function buildMcpServer(env: Env): McpServer {
-  const server = new McpServer({ name: "second-brain", version: "1.0.0" });
+  const server = new McpServer({ name: "second-brain", version: "1.1.0" });
 
   // ── remember ────────────────────────────────────────────────────────────
   server.tool(

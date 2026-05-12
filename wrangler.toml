@@ -14,8 +14,8 @@ database_id = ""
 [[vectorize]]
 binding = "VECTORIZE"
 index_name = "second-brain-vectors"
-# Created automatically by Deploy to Cloudflare button
-# Or manually: wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine
+# Using bge-m3 multilingual model (1024 dimensions) instead of bge-small-en (384)
+# Manually: wrangler vectorize create second-brain-vectors --dimensions=1024 --metric=cosine
 
 [ai]
 binding = "AI"
