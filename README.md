@@ -6,10 +6,12 @@
 
 | Thành phần | Bản gốc | Fork này |
 |---|---|---|
-| Embedding Model | `@cf/baai/bge-small-en-v1.5` | `@cf/baai/bge-m3` |
+| Embedding Model | `@cf/baai/bge-small-en-v1.5` | **`@cf/qwen/qwen3-embedding-0.6b`** |
 | Vector Dimensions | 384 | 1024 |
+| Context Window | 512 tokens | **32K tokens** |
 | Ngôn ngữ | Chỉ English | **100+ ngôn ngữ** (bao gồm tiếng Việt) |
-| Phiên bản MCP | 1.0.0 | 1.1.0 |
+| Instruction-aware | ❌ | ✅ |
+| Phiên bản MCP | 1.0.0 | 1.2.0 |
 
 ---
 
@@ -25,7 +27,7 @@ AI Client (Antigravity/Codex/Claude)
 │   ├── /capture → REST API          │
 │   └── /list   → REST API           │
 ├─────────────────────────────────────┤
-│   Workers AI (bge-m3)              │ ← Tạo embedding vector
+│   Workers AI (qwen3-embedding)     │ ← Tạo embedding vector
 │   Cloudflare D1 (SQLite)           │ ← Lưu nội dung gốc
 │   Cloudflare Vectorize (1024-dim)  │ ← Tìm kiếm semantic
 └─────────────────────────────────────┘
@@ -56,7 +58,7 @@ npx wrangler login
 npm run db:create
 # → Copy database_id từ output, paste vào wrangler.toml → [[d1_databases]] → database_id
 
-# 4. Tạo Vectorize index (1024 dimensions cho bge-m3)
+# 4. Tạo Vectorize index (1024 dimensions cho qwen3-embedding)
 npm run vectors:create
 
 # 5. Migrate schema lên remote
@@ -190,23 +192,25 @@ curl https://second-brain.<subdomain>.workers.dev/list?n=10 \
 
 ---
 
-## Tại sao dùng bge-m3?
+## Tại sao dùng Qwen3-Embedding?
 
-`bge-m3` (Multi-Functionality, Multi-Linguality, Multi-Granularity) được chọn vì:
+`qwen3-embedding-0.6b` được chọn sau khi benchmark với `bge-m3` vì:
 
-1. **100+ ngôn ngữ** — Tiếng Việt, tiếng Anh, tiếng Nhật, tiếng Hàn... tất cả trong 1 model
-2. **Multi-Granularity** — Tìm kiếm tốt cả đoạn ngắn (câu hỏi) lẫn đoạn dài (tài liệu)
-3. **Có sẵn trên Cloudflare Workers AI** — Free tier, không cần host model riêng
-4. **Cùng họ BAAI/BGE** với model gốc — Code thay đổi tối thiểu
+1. **MTEB score cao hơn ~7-8%** — Semantic search chính xác hơn
+2. **32K context window** — Ghi chú dài không bị cắt (bge-m3 chỉ 8K)
+3. **Instruction-aware** — Có thể thêm task-specific prompt để tăng chất lượng
+4. **Matryoshka Representation Learning (MRL)** — Linh hoạt dimensions (32–1024)
+5. **100+ ngôn ngữ** — Tiếng Việt, tiếng Anh, tiếng Nhật, tiếng Hàn...
+6. **Cùng giá với bge-m3** — $0.012/1M tokens, 1,075 neurons/1M tokens
 
 ### So sánh các model Cloudflare Workers AI
 
-| Model | Dimensions | Ngôn ngữ | Ghi chú |
-|---|---|---|---|
-| `bge-small-en-v1.5` | 384 | English only | Mặc định bản gốc |
-| **`bge-m3`** | 1024 | **100+ ngôn ngữ** | ⭐ **Dùng trong fork này** |
-| `embeddinggemma-300m` | — | 100+ ngôn ngữ | Google Gemma |
-| `qwen3-embedding-0.6b` | — | Multilingual | Qwen3, 4096 token |
+| Model | Dimensions | Context | Ngôn ngữ | Ghi chú |
+|---|---|---|---|---|
+| `bge-small-en-v1.5` | 384 | 512 | English only | Mặc định bản gốc |
+| `bge-m3` | 1024 | 8K | 100+ ngôn ngữ | Rất tốt, battle-tested |
+| **`qwen3-embedding-0.6b`** | 32–1024 | **32K** | **100+ ngôn ngữ** | ⭐ **Dùng trong fork này** |
+| `embeddinggemma-300m` | — | — | 100+ ngôn ngữ | Google Gemma |
 
 ---
 
@@ -238,7 +242,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8787/capture" `
 | Cloudflare Workers | Runtime serverless | Free (100k req/ngày) |
 | Cloudflare D1 | SQLite database | Free (5GB) |
 | Cloudflare Vectorize | Vector search index | Free (30M vector dimensions) |
-| Workers AI (bge-m3) | Text → Embedding | Free (10k tokens/phút) |
+| Workers AI (qwen3-embedding) | Text → Embedding | Free (10k neurons/ngày) |
 | MCP TypeScript SDK | Giao thức MCP | Open source |
 
 ---

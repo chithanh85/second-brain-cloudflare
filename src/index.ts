@@ -1,7 +1,7 @@
 /**
  * Second Brain — Cloudflare Worker
  * https://github.com/rahilp/second-brain-cloudflare
- * Modified by chithanh85: switched to bge-m3 multilingual model (1024-dim)
+ * Modified by chithanh85: switched to qwen3-embedding-0.6b multilingual model (1024-dim)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -29,9 +29,9 @@ const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 const DUPLICATE_FLAG_THRESHOLD = 0.85;
 
 // ─── Embedding Model ──────────────────────────────────────────────────────────
-// Using bge-m3: Multi-Functionality, Multi-Linguality (100+ languages incl. Vietnamese),
-// Multi-Granularity. Produces 1024-dimensional vectors.
-const EMBEDDING_MODEL = "@cf/baai/bge-m3";
+// Using Qwen3-Embedding-0.6B: 100+ languages (incl. Vietnamese), 32K context,
+// instruction-aware, Matryoshka Representation Learning (MRL). 1024-dim output.
+const EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -179,7 +179,7 @@ async function appendToEntry(
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
 function buildMcpServer(env: Env): McpServer {
-  const server = new McpServer({ name: "second-brain", version: "1.1.0" });
+  const server = new McpServer({ name: "second-brain", version: "1.2.0" });
 
   // ── remember ────────────────────────────────────────────────────────────
   server.tool(
