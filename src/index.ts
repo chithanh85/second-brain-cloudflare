@@ -5,7 +5,7 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { createMcpHandler } from "agents/mcp";
 import { z } from "zod";
 
 export interface Env {
@@ -197,6 +197,55 @@ async function insertVectors(env: Env, vectors: VectorizeVector[]): Promise<void
   }
 }
 
+async function initializeDatabase(env: Env): Promise<void> {
+  try {
+    await env.DB.exec(`
+      CREATE TABLE IF NOT EXISTS entries (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        tags TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL DEFAULT 'api',
+        created_at INTEGER NOT NULL,
+        vector_ids TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source);
+    `);
+
+    try {
+      await env.DB.exec(`ALTER TABLE entries ADD COLUMN vector_ids TEXT NOT NULL DEFAULT '[]'`);
+    } catch (e) {
+      if (!(e instanceof Error) || !e.message.toLowerCase().includes("duplicate column")) {
+        throw e;
+      }
+    }
+  } catch (e) {
+    console.error("Database initialization error:", e);
+    throw e;
+  }
+}
+
+let databaseInitPromise: Promise<void> | null = null;
+
+function ensureDatabase(env: Env): Promise<void> {
+  databaseInitPromise ??= initializeDatabase(env).catch((e) => {
+    databaseInitPromise = null;
+    throw e;
+  });
+  return databaseInitPromise;
+}
+
+function safeJsonArray(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 // ─── Duplicate detection ──────────────────────────────────────────────────────
 
 type DuplicateResult =
@@ -204,8 +253,50 @@ type DuplicateResult =
   | { status: "blocked"; matchId: string; score: number; embedding: number[] }
   | { status: "flagged"; matchId: string; score: number; embedding: number[] };
 
+interface RecallMatch {
+  id: string;
+  score: number;
+  metadata?: Record<string, unknown>;
+}
+
+function getDuplicateCheckSample(content: string): string {
+  if (content.length <= 1600) return content;
+
+  const start = content.slice(0, 500);
+  const midIndex = Math.floor(content.length / 2);
+  const middle = content.slice(Math.max(0, midIndex - 250), midIndex + 250);
+  const end = content.slice(-500);
+
+  return `${start}\n...\n${middle}\n...\n${end}`;
+}
+
+function getHalfLifeMs(tags: string[]): number {
+  if (tags.includes("task")) return 7 * 24 * 60 * 60 * 1000;
+  if (tags.includes("context")) return 180 * 24 * 60 * 60 * 1000;
+  if (tags.includes("work")) return 90 * 24 * 60 * 60 * 1000;
+  return 30 * 24 * 60 * 60 * 1000;
+}
+
+function rerankWithTimeDecay(matches: RecallMatch[]): RecallMatch[] {
+  const now = Date.now();
+
+  return matches
+    .map((match) => {
+      const meta = match.metadata;
+      const createdAt = typeof meta?.created_at === "number" ? meta.created_at : now;
+      const tags = Array.isArray(meta?.tags)
+        ? meta.tags.filter((tag): tag is string => typeof tag === "string")
+        : [];
+      const ageMs = Math.max(0, now - createdAt);
+      const recencyMultiplier = Math.exp(-ageMs / getHalfLifeMs(tags));
+
+      return { ...match, score: match.score * recencyMultiplier };
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
 async function checkDuplicate(content: string, env: Env): Promise<DuplicateResult> {
-  const values = await embed(content.slice(0, 500), env);
+  const values = await embed(getDuplicateCheckSample(content), env);
   const results = await env.VECTORIZE.query(values, { topK: 1, returnMetadata: "all" });
 
   if (!results.matches.length) return { status: "unique", embedding: values };
@@ -252,7 +343,7 @@ async function storeEntry(
   source: string,
   now: number,
   precomputedEmbedding?: number[]
-): Promise<void> {
+): Promise<string[]> {
   const chunks = chunkText(content);
 
   const chunkEmbeddings = new Map<number, number[]>();
@@ -285,6 +376,13 @@ async function storeEntry(
   }
 
   await insertVectors(env, vectors);
+  const vectorIds = vectors.map((vector) => vector.id);
+
+  await env.DB.prepare(
+    `UPDATE entries SET vector_ids = ? WHERE id = ?`
+  ).bind(JSON.stringify(vectorIds), id).run();
+
+  return vectorIds;
 }
 
 // ─── Append to existing entry ─────────────────────────────────────────────────
@@ -311,6 +409,7 @@ async function appendToEntry(
   const chunks = chunkText(addition);
   const embeddings = await embedTextsInBatches(chunks, env);
   const updateIdBase = `${id}-update-${Date.now()}`;
+  const createdAt = Date.now();
 
   const vectors: VectorizeVector[] = chunks.map((chunk, i) => ({
     id: `${updateIdBase}-${i}`,
@@ -323,11 +422,20 @@ async function appendToEntry(
       isUpdate: true,
       tags,
       source,
-      created_at: Date.now(),
+      created_at: createdAt,
     },
   }));
 
   await insertVectors(env, vectors);
+
+  const row = await env.DB.prepare(
+    `SELECT vector_ids FROM entries WHERE id = ?`
+  ).bind(id).first() as Record<string, unknown> | null;
+  const vectorIds = [...safeJsonArray(row?.vector_ids), ...vectors.map((vector) => vector.id)];
+
+  await env.DB.prepare(
+    `UPDATE entries SET vector_ids = ? WHERE id = ?`
+  ).bind(JSON.stringify(vectorIds), id).run();
 }
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
@@ -373,8 +481,8 @@ function buildMcpServer(env: Env): McpServer {
       const finalTags = dup.status === "flagged" ? [...t, "duplicate-candidate"] : t;
 
       await env.DB.prepare(
-        `INSERT INTO entries (id, content, tags, source, created_at) VALUES (?, ?, ?, ?, ?)`
-      ).bind(id, c, JSON.stringify(finalTags), s, now).run();
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(id, c, JSON.stringify(finalTags), s, now, "[]").run();
 
       try {
         await storeEntry(env, id, c, finalTags, s, now, dup.embedding);
@@ -416,7 +524,7 @@ function buildMcpServer(env: Env): McpServer {
       }
 
       const existingContent = row.content as string;
-      const tags: string[] = JSON.parse(row.tags ?? "[]");
+      const tags = safeJsonArray(row.tags);
       const source = row.source as string;
       let a: string;
 
@@ -464,11 +572,22 @@ function buildMcpServer(env: Env): McpServer {
         return toolValidationError(e);
       }
 
-      const queryTopK = Math.min(topK * 3, MAX_VECTORIZE_TOP_K_WITH_METADATA);
+      let tagFilterIds: Set<string> | null = null;
+      if (requestedTag) {
+        const { results: tagRows } = await env.DB.prepare(
+          `SELECT id FROM entries WHERE tags LIKE ?`
+        ).bind(`%"${requestedTag}"%`).all();
+
+        tagFilterIds = new Set((tagRows as Record<string, unknown>[]).map((row) => row.id as string));
+        if (!tagFilterIds.size) {
+          return { content: [{ type: "text", text: "Nothing found matching that query." }] };
+        }
+      }
+
+      const queryTopK = requestedTag ? MAX_VECTORIZE_TOP_K_WITH_METADATA : Math.min(topK * 3, MAX_VECTORIZE_TOP_K_WITH_METADATA);
       const values = await embed(q, env);
       const results = await env.VECTORIZE.query(values, {
         topK: queryTopK,
-        filter: requestedTag ? { tags: { $eq: requestedTag } } : undefined,
         returnMetadata: "all",
       });
 
@@ -476,22 +595,46 @@ function buildMcpServer(env: Env): McpServer {
         return { content: [{ type: "text", text: "Nothing found matching that query." }] };
       }
 
+      const reranked = rerankWithTimeDecay(results.matches as RecallMatch[]);
       const seen = new Set<string>();
-      const deduped = results.matches.filter((m) => {
+      const deduped = reranked.filter((m) => {
         const parentId = (m.metadata as any)?.parentId ?? m.id;
         if (seen.has(parentId)) return false;
+        if (tagFilterIds && !tagFilterIds.has(parentId)) return false;
         seen.add(parentId);
         return true;
       }).slice(0, topK);
 
+      if (!deduped.length) {
+        return { content: [{ type: "text", text: "Nothing found matching that query." }] };
+      }
+
+      const parentIds = deduped.map((m) => ((m.metadata as any)?.parentId ?? m.id) as string);
+      const placeholders = parentIds.map(() => "?").join(", ");
+      const { results: d1Rows } = await env.DB.prepare(
+        `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders})`
+      ).bind(...parentIds).all() as { results: Record<string, unknown>[] };
+      const d1Map = new Map(d1Rows.map((row) => [row.id as string, row]));
+
       const text = deduped.map((m, i) => {
         const meta = m.metadata as Record<string, any>;
+        const parentId = (meta?.parentId ?? m.id) as string;
+        const row = d1Map.get(parentId);
+        const score = (m.score * 100).toFixed(0);
+        const updateLabel = meta?.isUpdate ? " [updated]" : "";
+
+        if (row) {
+          const date = typeof row.created_at === "number" ? new Date(row.created_at).toLocaleDateString() : "?";
+          const tags = safeJsonArray(row.tags);
+          const tagList = tags.length ? ` [${tags.join(", ")}]` : "";
+          const src = row.source ? ` · ${row.source as string}` : "";
+          return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}\n${row.content as string}`;
+        }
+
         const date = meta?.created_at ? new Date(meta.created_at as number).toLocaleDateString() : "?";
         const tagList = Array.isArray(meta?.tags) && meta.tags.length ? ` [${(meta.tags as string[]).join(", ")}]` : "";
         const src = meta?.source ? ` · ${meta.source}` : "";
-        const score = (m.score * 100).toFixed(0);
         const chunkLabel = meta?.totalChunks > 1 ? ` (chunk ${meta.chunkIndex + 1}/${meta.totalChunks})` : "";
-        const updateLabel = meta?.isUpdate ? " [updated]" : "";
         return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${chunkLabel}${updateLabel}\n${meta?.content ?? ""}`;
       }).join("\n\n");
 
@@ -528,7 +671,7 @@ function buildMcpServer(env: Env): McpServer {
 
       const text = (results as Record<string, any>[]).map((row, i) => {
         const date = new Date(row.created_at as number).toLocaleDateString();
-        const tags: string[] = JSON.parse(row.tags ?? "[]");
+        const tags = safeJsonArray(row.tags);
         const tagStr = tags.length ? ` · ${tags.join(", ")}` : "";
         return `${i + 1}. [${date} · ${row.source}${tagStr}]\nID: ${row.id as string}\n${row.content}`;
       }).join("\n\n");
@@ -543,17 +686,25 @@ function buildMcpServer(env: Env): McpServer {
     "Delete an entry from your second brain by ID",
     { id: z.string().describe("Entry ID from recall or list_recent") },
     async ({ id }) => {
+      const row = await env.DB.prepare(
+        `SELECT vector_ids FROM entries WHERE id = ?`
+      ).bind(id).first() as Record<string, unknown> | null;
+      const trackedVectorIds = safeJsonArray(row?.vector_ids);
+
       await env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind(id).run();
 
       try {
-        const chunkIds = Array.from({ length: 20 }, (_, i) => `${id}-chunk-${i}`);
-        const updateIds = Array.from({ length: 50 }, (_, i) => `${id}-update-${i}`);
-        await env.VECTORIZE.deleteByIds([id, ...chunkIds, ...updateIds]);
+        if (trackedVectorIds.length) {
+          await env.VECTORIZE.deleteByIds(trackedVectorIds);
+        } else {
+          const chunkIds = Array.from({ length: 20 }, (_, i) => `${id}-chunk-${i}`);
+          await env.VECTORIZE.deleteByIds([id, ...chunkIds]);
+        }
       } catch (e) {
         console.error("Vectorize delete failed (non-fatal):", e);
       }
 
-      return { content: [{ type: "text", text: `Deleted entry ${id}` }] };
+      return { content: [{ type: "text", text: `Deleted entry ${id} and ${trackedVectorIds.length} vector(s)` }] };
     }
   );
 
@@ -569,6 +720,8 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
     }
+
+    await ensureDatabase(env);
 
     // POST /capture
     if (url.pathname === "/capture" && request.method === "POST") {
@@ -613,8 +766,8 @@ export default {
       const finalTags = dup.status === "flagged" ? [...t, "duplicate-candidate"] : t;
 
       await env.DB.prepare(
-        `INSERT INTO entries (id, content, tags, source, created_at) VALUES (?, ?, ?, ?, ?)`
-      ).bind(id, c, JSON.stringify(finalTags), s, now).run();
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(id, c, JSON.stringify(finalTags), s, now, "[]").run();
 
       ctx.waitUntil(
         storeEntry(env, id, c, finalTags, s, now, dup.embedding)
@@ -652,12 +805,8 @@ export default {
       const largeBodyResponse = rejectLargeBody(request);
       if (largeBodyResponse) return largeBodyResponse;
 
-      const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-      });
       const server = buildMcpServer(env);
-      await server.connect(transport);
-      return transport.handleRequest(request);
+      return createMcpHandler(server)(request, env, ctx);
     }
 
     return new Response("Not found", { status: 404 });

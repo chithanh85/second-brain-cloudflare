@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS entries (
   content     TEXT NOT NULL,
   tags        TEXT NOT NULL DEFAULT '[]',  -- JSON array
   source      TEXT NOT NULL DEFAULT 'api', -- 'phone', 'browser', 'voice', 'claude', 'api'
-  created_at  INTEGER NOT NULL             -- Unix ms timestamp
+  created_at  INTEGER NOT NULL,            -- Unix ms timestamp
+  vector_ids  TEXT NOT NULL DEFAULT '[]'   -- JSON array of Vectorize IDs
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
