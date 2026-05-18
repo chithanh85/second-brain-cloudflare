@@ -27,6 +27,16 @@ const CORS_HEADERS = {
 
 const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 const DUPLICATE_FLAG_THRESHOLD = 0.85;
+const MAX_JSON_BODY_BYTES = 256_000;
+const MAX_CONTENT_CHARS = 50_000;
+const MAX_ADDITION_CHARS = 20_000;
+const MAX_QUERY_CHARS = 2_000;
+const MAX_TAGS = 20;
+const MAX_TAG_CHARS = 64;
+const MAX_SOURCE_CHARS = 64;
+const MAX_EMBEDDING_BATCH_SIZE = 32;
+const MAX_VECTORIZE_INSERT_BATCH_SIZE = 500;
+const MAX_VECTORIZE_TOP_K_WITH_METADATA = 50;
 
 // ─── Embedding Model ──────────────────────────────────────────────────────────
 // Using Qwen3-Embedding-0.6B: 100+ languages (incl. Vietnamese), 32K context,
@@ -34,6 +44,13 @@ const DUPLICATE_FLAG_THRESHOLD = 0.85;
 const EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+class ValidationError extends Error {
+  constructor(message: string, public status = 400) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
 
 function isAuthorized(request: Request, env: Env): boolean {
   return request.headers.get("Authorization") === `Bearer ${env.AUTH_TOKEN}`;
@@ -46,31 +63,160 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function rejectLargeBody(request: Request): Response | null {
+  const contentLength = request.headers.get("Content-Length");
+  if (!contentLength) return null;
+
+  const bytes = Number(contentLength);
+  if (Number.isFinite(bytes) && bytes > MAX_JSON_BODY_BYTES) {
+    return json({ error: `Request body is too large. Limit: ${MAX_JSON_BODY_BYTES} bytes` }, 413);
+  }
+
+  return null;
+}
+
+async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
+  const rawBody = await request.text();
+  if (rawBody.length > MAX_JSON_BODY_BYTES) {
+    throw new ValidationError(`Request body is too large. Limit: ${MAX_JSON_BODY_BYTES} characters`, 413);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    throw new ValidationError("Invalid JSON");
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ValidationError("JSON body must be an object");
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+function assertText(value: unknown, field: string, maxChars: number): string {
+  if (typeof value !== "string") {
+    throw new ValidationError(`${field} must be a string`);
+  }
+
+  const text = value.trim();
+  if (!text) {
+    throw new ValidationError(`${field} is required`);
+  }
+
+  if (text.length > maxChars) {
+    throw new ValidationError(`${field} is too long. Limit: ${maxChars} characters`, 413);
+  }
+
+  return text;
+}
+
+function normalizeTags(tags: unknown): string[] {
+  if (tags === undefined || tags === null) return [];
+  if (!Array.isArray(tags)) {
+    throw new ValidationError("tags must be an array of strings");
+  }
+  if (tags.length > MAX_TAGS) {
+    throw new ValidationError(`Too many tags. Limit: ${MAX_TAGS}`);
+  }
+
+  const normalized: string[] = [];
+  for (const tag of tags) {
+    if (typeof tag !== "string") {
+      throw new ValidationError("tags must be an array of strings");
+    }
+
+    const trimmed = tag.trim();
+    if (!trimmed) continue;
+    if (trimmed.length > MAX_TAG_CHARS) {
+      throw new ValidationError(`Tag is too long. Limit: ${MAX_TAG_CHARS} characters`);
+    }
+    if (!normalized.includes(trimmed)) normalized.push(trimmed);
+  }
+
+  return normalized;
+}
+
+function normalizeSource(source: unknown, fallback: string): string {
+  if (source === undefined || source === null || source === "") return fallback;
+  if (typeof source !== "string") {
+    throw new ValidationError("source must be a string");
+  }
+
+  const normalized = source.trim();
+  if (!normalized) return fallback;
+  if (normalized.length > MAX_SOURCE_CHARS) {
+    throw new ValidationError(`source is too long. Limit: ${MAX_SOURCE_CHARS} characters`);
+  }
+
+  return normalized;
+}
+
+function toolText(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+function toolValidationError(error: unknown) {
+  if (error instanceof ValidationError) return toolText(error.message);
+  throw error;
+}
+
+async function embedMany(texts: string[], env: Env): Promise<number[][]> {
+  if (!texts.length) return [];
+
+  const result = (await env.AI.run(EMBEDDING_MODEL as any, { text: texts })) as { data?: unknown };
+  const data = result.data;
+
+  if (!Array.isArray(data) || data.length !== texts.length || !data.every((item) => Array.isArray(item))) {
+    throw new Error("Unexpected embedding response from Workers AI");
+  }
+
+  return data as number[][];
+}
+
 async function embed(text: string, env: Env): Promise<number[]> {
-  const result = (await env.AI.run(EMBEDDING_MODEL as any, { text: [text] })) as any;
-  return result.data[0] as number[];
+  const [embedding] = await embedMany([text], env);
+  return embedding;
+}
+
+async function embedTextsInBatches(texts: string[], env: Env): Promise<number[][]> {
+  const embeddings: number[][] = [];
+
+  for (let i = 0; i < texts.length; i += MAX_EMBEDDING_BATCH_SIZE) {
+    const batch = texts.slice(i, i + MAX_EMBEDDING_BATCH_SIZE);
+    embeddings.push(...await embedMany(batch, env));
+  }
+
+  return embeddings;
+}
+
+async function insertVectors(env: Env, vectors: VectorizeVector[]): Promise<void> {
+  for (let i = 0; i < vectors.length; i += MAX_VECTORIZE_INSERT_BATCH_SIZE) {
+    await env.VECTORIZE.insert(vectors.slice(i, i + MAX_VECTORIZE_INSERT_BATCH_SIZE));
+  }
 }
 
 // ─── Duplicate detection ──────────────────────────────────────────────────────
 
 type DuplicateResult =
-  | { status: "unique" }
-  | { status: "blocked"; matchId: string; score: number }
-  | { status: "flagged"; matchId: string; score: number };
+  | { status: "unique"; embedding: number[] }
+  | { status: "blocked"; matchId: string; score: number; embedding: number[] }
+  | { status: "flagged"; matchId: string; score: number; embedding: number[] };
 
 async function checkDuplicate(content: string, env: Env): Promise<DuplicateResult> {
   const values = await embed(content.slice(0, 500), env);
   const results = await env.VECTORIZE.query(values, { topK: 1, returnMetadata: "all" });
 
-  if (!results.matches.length) return { status: "unique" };
+  if (!results.matches.length) return { status: "unique", embedding: values };
 
   const top = results.matches[0];
   const score = top.score;
   const matchId = (top.metadata as any)?.parentId ?? top.id;
 
-  if (score >= DUPLICATE_BLOCK_THRESHOLD) return { status: "blocked", matchId, score };
-  if (score >= DUPLICATE_FLAG_THRESHOLD) return { status: "flagged", matchId, score };
-  return { status: "unique" };
+  if (score >= DUPLICATE_BLOCK_THRESHOLD) return { status: "blocked", matchId, score, embedding: values };
+  if (score >= DUPLICATE_FLAG_THRESHOLD) return { status: "flagged", matchId, score, embedding: values };
+  return { status: "unique", embedding: values };
 }
 
 // ─── Chunking ─────────────────────────────────────────────────────────────────
@@ -104,14 +250,28 @@ async function storeEntry(
   content: string,
   tags: string[],
   source: string,
-  now: number
+  now: number,
+  precomputedEmbedding?: number[]
 ): Promise<void> {
   const chunks = chunkText(content);
 
-  const vectors = await Promise.all(
-    chunks.map(async (chunk, i) => ({
+  const chunkEmbeddings = new Map<number, number[]>();
+  if (chunks.length === 1 && precomputedEmbedding) {
+    chunkEmbeddings.set(0, precomputedEmbedding);
+  } else {
+    const embeddings = await embedTextsInBatches(chunks, env);
+    embeddings.forEach((values, i) => chunkEmbeddings.set(i, values));
+  }
+
+  const vectors: VectorizeVector[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const values = chunkEmbeddings.get(i);
+    if (!values) throw new Error(`Missing embedding for chunk ${i}`);
+
+    const chunk = chunks[i];
+    vectors.push({
       id: chunks.length === 1 ? id : `${id}-chunk-${i}`,
-      values: await embed(chunk, env),
+      values,
       metadata: {
         content: chunk.slice(0, 512),
         parentId: id,
@@ -121,10 +281,10 @@ async function storeEntry(
         source,
         created_at: now,
       },
-    }))
-  );
+    });
+  }
 
-  await env.VECTORIZE.insert(vectors);
+  await insertVectors(env, vectors);
 }
 
 // ─── Append to existing entry ─────────────────────────────────────────────────
@@ -148,32 +308,26 @@ async function appendToEntry(
     `UPDATE entries SET content = ? WHERE id = ?`
   ).bind(newContent, id).run();
 
-  // Count existing chunks so we don't collide on IDs
-  // Vectorize doesn't have a list-by-prefix API so we track via D1
-  // We store chunk count in a simple way: try IDs until we find a gap
-  let chunkIndex = 0;
-  // Find next available chunk index by checking if base ID exists
-  // For single-chunk entries the base ID is used directly, so start at 1
-  // For multi-chunk entries, chunks are {id}-chunk-0, {id}-chunk-1, etc.
-  // We add the new addition chunk at the next available index
-  // Safe approach: use timestamp-based suffix to guarantee uniqueness
-  const newChunkId = `${id}-update-${Date.now()}`;
+  const chunks = chunkText(addition);
+  const embeddings = await embedTextsInBatches(chunks, env);
+  const updateIdBase = `${id}-update-${Date.now()}`;
 
-  const values = await embed(addition, env);
-  await env.VECTORIZE.insert([{
-    id: newChunkId,
-    values,
+  const vectors: VectorizeVector[] = chunks.map((chunk, i) => ({
+    id: `${updateIdBase}-${i}`,
+    values: embeddings[i],
     metadata: {
-      content: addition.slice(0, 512),
+      content: chunk.slice(0, 512),
       parentId: id,
-      chunkIndex: chunkIndex,
-      totalChunks: 1,
+      chunkIndex: i,
+      totalChunks: chunks.length,
       isUpdate: true,
       tags,
       source,
       created_at: Date.now(),
     },
-  }]);
+  }));
+
+  await insertVectors(env, vectors);
 }
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
@@ -186,14 +340,22 @@ function buildMcpServer(env: Env): McpServer {
     "remember",
     "Store an idea, task, or note in your second brain",
     {
-      content: z.string().describe("The idea, task, or note to store"),
-      tags: z.array(z.string()).optional().describe("Optional tags for filtering"),
-      source: z.string().optional().describe("Origin: phone, browser, voice, claude"),
+      content: z.string().min(1).max(MAX_CONTENT_CHARS).describe("The idea, task, or note to store"),
+      tags: z.array(z.string().min(1).max(MAX_TAG_CHARS)).max(MAX_TAGS).optional().describe("Optional tags for filtering"),
+      source: z.string().max(MAX_SOURCE_CHARS).optional().describe("Origin: phone, browser, voice, claude"),
     },
     async ({ content, tags, source }) => {
-      const c = content.trim();
-      const t = tags ?? [];
-      const s = source ?? "claude";
+      let c: string;
+      let t: string[];
+      let s: string;
+
+      try {
+        c = assertText(content, "content", MAX_CONTENT_CHARS);
+        t = normalizeTags(tags);
+        s = normalizeSource(source, "claude");
+      } catch (e) {
+        return toolValidationError(e);
+      }
 
       const dup = await checkDuplicate(c, env);
 
@@ -215,7 +377,7 @@ function buildMcpServer(env: Env): McpServer {
       ).bind(id, c, JSON.stringify(finalTags), s, now).run();
 
       try {
-        await storeEntry(env, id, c, finalTags, s, now);
+        await storeEntry(env, id, c, finalTags, s, now, dup.embedding);
       } catch (e) {
         console.error("Vectorize insert failed (non-fatal):", e);
       }
@@ -239,7 +401,7 @@ function buildMcpServer(env: Env): McpServer {
     "Append new information to an existing entry in your second brain. Use this when something has changed or you have an update to a stored note — preserves the original and adds the update with a timestamp.",
     {
       id: z.string().describe("Entry ID to append to — from recall or list_recent"),
-      addition: z.string().describe("The new information to add to the existing entry"),
+      addition: z.string().min(1).max(MAX_ADDITION_CHARS).describe("The new information to add to the existing entry"),
     },
     async ({ id, addition }) => {
       // Look up the existing entry
@@ -256,12 +418,12 @@ function buildMcpServer(env: Env): McpServer {
       const existingContent = row.content as string;
       const tags: string[] = JSON.parse(row.tags ?? "[]");
       const source = row.source as string;
-      const a = addition.trim();
+      let a: string;
 
-      if (!a) {
-        return {
-          content: [{ type: "text", text: "Addition cannot be empty." }],
-        };
+      try {
+        a = assertText(addition, "addition", MAX_ADDITION_CHARS);
+      } catch (e) {
+        return toolValidationError(e);
       }
 
       try {
@@ -287,15 +449,26 @@ function buildMcpServer(env: Env): McpServer {
     "recall",
     "Semantically search your second brain for relevant notes",
     {
-      query: z.string().describe("Natural language search query"),
+      query: z.string().min(1).max(MAX_QUERY_CHARS).describe("Natural language search query"),
       topK: z.number().int().min(1).max(20).default(5).describe("Number of results"),
-      tag: z.string().optional().describe("Filter by a specific tag"),
+      tag: z.string().min(1).max(MAX_TAG_CHARS).optional().describe("Filter by a specific tag"),
     },
     async ({ query, topK, tag }) => {
-      const values = await embed(query, env);
+      let q: string;
+      let requestedTag: string | undefined;
+
+      try {
+        q = assertText(query, "query", MAX_QUERY_CHARS);
+        requestedTag = tag ? assertText(tag, "tag", MAX_TAG_CHARS) : undefined;
+      } catch (e) {
+        return toolValidationError(e);
+      }
+
+      const queryTopK = Math.min(topK * 3, MAX_VECTORIZE_TOP_K_WITH_METADATA);
+      const values = await embed(q, env);
       const results = await env.VECTORIZE.query(values, {
-        topK: topK * 3,
-        filter: tag ? { tags: { $eq: tag } } : undefined,
+        topK: queryTopK,
+        filter: requestedTag ? { tags: { $eq: requestedTag } } : undefined,
         returnMetadata: "all",
       });
 
@@ -332,12 +505,19 @@ function buildMcpServer(env: Env): McpServer {
     "List the most recent entries from your second brain",
     {
       n: z.number().int().min(1).max(50).default(10),
-      tag: z.string().optional(),
+      tag: z.string().min(1).max(MAX_TAG_CHARS).optional(),
     },
     async ({ n, tag }) => {
+      let requestedTag: string | undefined;
+      try {
+        requestedTag = tag ? assertText(tag, "tag", MAX_TAG_CHARS) : undefined;
+      } catch (e) {
+        return toolValidationError(e);
+      }
+
       let q = `SELECT id, content, tags, source, created_at FROM entries`;
       const p: (string | number)[] = [];
-      if (tag) { q += ` WHERE tags LIKE ?`; p.push(`%"${tag}"%`); }
+      if (requestedTag) { q += ` WHERE tags LIKE ?`; p.push(`%"${requestedTag}"%`); }
       q += ` ORDER BY created_at DESC LIMIT ?`; p.push(n);
 
       const { results } = await env.DB.prepare(q).bind(...p).all();
@@ -367,10 +547,8 @@ function buildMcpServer(env: Env): McpServer {
 
       try {
         const chunkIds = Array.from({ length: 20 }, (_, i) => `${id}-chunk-${i}`);
-        await env.VECTORIZE.deleteByIds([id, ...chunkIds]);
-        // Also attempt to delete any update chunks
         const updateIds = Array.from({ length: 50 }, (_, i) => `${id}-update-${i}`);
-        await env.VECTORIZE.deleteByIds(updateIds);
+        await env.VECTORIZE.deleteByIds([id, ...chunkIds, ...updateIds]);
       } catch (e) {
         console.error("Vectorize delete failed (non-fatal):", e);
       }
@@ -395,14 +573,28 @@ export default {
     // POST /capture
     if (url.pathname === "/capture" && request.method === "POST") {
       if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+      const largeBodyResponse = rejectLargeBody(request);
+      if (largeBodyResponse) return largeBodyResponse;
 
-      let body: { content?: string; tags?: string[]; source?: string };
-      try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
-      if (!body.content?.trim()) return json({ error: "content is required" }, 400);
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonObject(request);
+      } catch (e) {
+        if (e instanceof ValidationError) return json({ error: e.message }, e.status);
+        throw e;
+      }
 
-      const c = body.content.trim();
-      const t = body.tags ?? [];
-      const s = body.source ?? "api";
+      let c: string;
+      let t: string[];
+      let s: string;
+      try {
+        c = assertText(body.content, "content", MAX_CONTENT_CHARS);
+        t = normalizeTags(body.tags);
+        s = normalizeSource(body.source, "api");
+      } catch (e) {
+        if (e instanceof ValidationError) return json({ error: e.message }, e.status);
+        throw e;
+      }
 
       const dup = await checkDuplicate(c, env);
 
@@ -425,7 +617,7 @@ export default {
       ).bind(id, c, JSON.stringify(finalTags), s, now).run();
 
       ctx.waitUntil(
-        storeEntry(env, id, c, finalTags, s, now)
+        storeEntry(env, id, c, finalTags, s, now, dup.embedding)
           .catch((e) => console.error("Async embed failed:", e))
       );
 
@@ -446,7 +638,8 @@ export default {
     // GET /list
     if (url.pathname === "/list" && request.method === "GET") {
       if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
-      const n = Math.min(parseInt(url.searchParams.get("n") ?? "20", 10), 100);
+      const requestedN = parseInt(url.searchParams.get("n") ?? "20", 10);
+      const n = Number.isFinite(requestedN) ? Math.min(Math.max(requestedN, 1), 100) : 20;
       const { results } = await env.DB.prepare(
         `SELECT id, content, tags, source, created_at FROM entries ORDER BY created_at DESC LIMIT ?`
       ).bind(n).all();
@@ -455,6 +648,10 @@ export default {
 
     // /mcp
     if (url.pathname === "/mcp") {
+      if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+      const largeBodyResponse = rejectLargeBody(request);
+      if (largeBodyResponse) return largeBodyResponse;
+
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
