@@ -212,12 +212,11 @@ async function initializeDatabase(env: Env): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source);
     `);
 
-    try {
+    const { results } = await env.DB.prepare(`PRAGMA table_info(entries)`).all();
+    const hasVectorIds = (results as Record<string, unknown>[]).some((column) => column.name === "vector_ids");
+
+    if (!hasVectorIds) {
       await env.DB.exec(`ALTER TABLE entries ADD COLUMN vector_ids TEXT NOT NULL DEFAULT '[]'`);
-    } catch (e) {
-      if (!(e instanceof Error) || !e.message.toLowerCase().includes("duplicate column")) {
-        throw e;
-      }
     }
   } catch (e) {
     console.error("Database initialization error:", e);
@@ -721,7 +720,9 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    await ensureDatabase(env);
+    ctx.waitUntil(
+      ensureDatabase(env).catch((e) => console.error("Async database initialization failed:", e))
+    );
 
     // POST /capture
     if (url.pathname === "/capture" && request.method === "POST") {
