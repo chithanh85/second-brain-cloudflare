@@ -9,7 +9,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "second-brain-db"
-database_id = "7360255f-5f50-4801-8a11-57aff3820729"
+database_id = "343e1265-2fb8-4696-b84d-1cecb6e2a7e6"
 
 [[vectorize]]
 binding = "VECTORIZE"

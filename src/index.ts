@@ -53,7 +53,9 @@ class ValidationError extends Error {
 }
 
 function isAuthorized(request: Request, env: Env): boolean {
-  return request.headers.get("Authorization") === `Bearer ${env.AUTH_TOKEN}`;
+  const authHeader = (request.headers.get("Authorization") || "").trim();
+  const expectedToken = (env.AUTH_TOKEN || "").trim();
+  return authHeader === `Bearer ${expectedToken}`;
 }
 
 function json(data: unknown, status = 200): Response {
@@ -475,9 +477,29 @@ function buildMcpServer(env: Env): McpServer {
         };
       }
 
+      let autoTags: string[] = [];
+      try {
+        if (env.AI) {
+          const prompt = `Extract 2 to 4 concise technical topic tags (lowercase, hyphenated, e.g. "mql5", "wfo", "kaggle-gpu") for this text. Respond ONLY with a JSON array of strings, e.g. ["tag1", "tag2"]. Text: ${c.substring(0, 1000)}`;
+          const response = (await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+            messages: [{ role: "user", content: prompt }]
+          })) as { response?: string };
+          const match = (response?.response || "").match(/\[.*\]/s);
+          if (match) {
+            const parsed = JSON.parse(match[0]);
+            if (Array.isArray(parsed)) {
+              autoTags = parsed.map((x) => String(x).toLowerCase().trim().replace(/[^a-z0-9-]/g, "")).filter(Boolean);
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Auto-tag generation failed:", e);
+      }
+
+      const mergedTags = Array.from(new Set([...t, ...autoTags]));
       const id = crypto.randomUUID();
       const now = Date.now();
-      const finalTags = dup.status === "flagged" ? [...t, "duplicate-candidate"] : t;
+      const finalTags = dup.status === "flagged" ? [...mergedTags, "duplicate-candidate"] : mergedTags;
 
       await env.DB.prepare(
         `INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, ?, ?, ?, ?)`
