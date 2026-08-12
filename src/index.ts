@@ -1,7 +1,12 @@
 /**
- * Second Brain — Cloudflare Worker
- * https://github.com/rahilp/second-brain-cloudflare
- * Modified by chithanh85: switched to qwen3-embedding-0.6b multilingual model (1024-dim)
+ * Second Brain v2.0 — Cloudflare Worker
+ * https://github.com/chithanh85/second-brain-cloudflare
+ *
+ * Features:
+ *   - Memory Graph with auto-linking & multi-hop recall
+ *   - Graceful Degradation (Vectorize → SQL keyword fallback)
+ *   - Advanced Recall (recency weighting, MMR diversity, similarity cutoff)
+ *   - Qwen3-Embedding-0.6B multilingual model (1024-dim, 32K context)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -27,6 +32,7 @@ const CORS_HEADERS = {
 
 const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 const DUPLICATE_FLAG_THRESHOLD = 0.85;
+const AUTO_LINK_THRESHOLD = 0.6;
 const MAX_JSON_BODY_BYTES = 256_000;
 const MAX_CONTENT_CHARS = 50_000;
 const MAX_ADDITION_CHARS = 20_000;
@@ -37,10 +43,15 @@ const MAX_SOURCE_CHARS = 64;
 const MAX_EMBEDDING_BATCH_SIZE = 32;
 const MAX_VECTORIZE_INSERT_BATCH_SIZE = 500;
 const MAX_VECTORIZE_TOP_K_WITH_METADATA = 50;
+const RECENCY_WEIGHT_DEFAULT = 0.3;
+const MAX_HOPS = 3;
+const MAX_CONNECTIONS_DEPTH = 3;
+
+// Edge relation types
+const VALID_RELATIONS = ["related", "extends", "contradicts", "depends_on"] as const;
+type EdgeRelation = (typeof VALID_RELATIONS)[number];
 
 // ─── Embedding Model ──────────────────────────────────────────────────────────
-// Using Qwen3-Embedding-0.6B: 100+ languages (incl. Vietnamese), 32K context,
-// instruction-aware, Matryoshka Representation Learning (MRL). 1024-dim output.
 const EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -199,27 +210,30 @@ async function insertVectors(env: Env, vectors: VectorizeVector[]): Promise<void
   }
 }
 
+// ─── Database initialization ──────────────────────────────────────────────────
+
 async function initializeDatabase(env: Env): Promise<void> {
   try {
-    await env.DB.exec(`
-      CREATE TABLE IF NOT EXISTS entries (
-        id TEXT PRIMARY KEY,
-        content TEXT NOT NULL,
-        tags TEXT NOT NULL DEFAULT '[]',
-        source TEXT NOT NULL DEFAULT 'api',
-        created_at INTEGER NOT NULL,
-        vector_ids TEXT NOT NULL DEFAULT '[]'
-      );
-      CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source);
-    `);
+    // Use batch with individual statements (D1 exec() has issues with multi-line CREATE TABLE on production)
+    await env.DB.batch([
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`),
+      env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`),
+      env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source)`),
+    ]);
 
     const { results } = await env.DB.prepare(`PRAGMA table_info(entries)`).all();
     const hasVectorIds = (results as Record<string, unknown>[]).some((column) => column.name === "vector_ids");
 
     if (!hasVectorIds) {
-      await env.DB.exec(`ALTER TABLE entries ADD COLUMN vector_ids TEXT NOT NULL DEFAULT '[]'`);
+      await env.DB.prepare(`ALTER TABLE entries ADD COLUMN vector_ids TEXT NOT NULL DEFAULT '[]'`).run();
     }
+
+    // ── Memory Graph: edges table ──
+    await env.DB.batch([
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS edges (source_id TEXT NOT NULL, target_id TEXT NOT NULL, relation TEXT NOT NULL DEFAULT 'related', weight REAL NOT NULL DEFAULT 1.0, created_at INTEGER NOT NULL, PRIMARY KEY (source_id, target_id))`),
+      env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`),
+      env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`),
+    ]);
   } catch (e) {
     console.error("Database initialization error:", e);
     throw e;
@@ -247,12 +261,79 @@ function safeJsonArray(value: unknown): string[] {
   }
 }
 
+// ─── Graceful Degradation ─────────────────────────────────────────────────────
+
+interface SafeQueryResult {
+  matches: RecallMatch[];
+  degraded: boolean;
+}
+
+async function safeVectorizeQuery(
+  env: Env,
+  values: number[],
+  options: { topK: number; returnMetadata?: "all" | "indexed" | "none" }
+): Promise<SafeQueryResult> {
+  try {
+    const results = await env.VECTORIZE.query(values, options);
+    return { matches: results.matches as RecallMatch[], degraded: false };
+  } catch (e) {
+    console.error("Vectorize query failed, degrading to keyword search:", e);
+    return { matches: [], degraded: true };
+  }
+}
+
+/**
+ * SQL keyword fallback when Vectorize is unavailable.
+ * Splits query into words, searches D1 with LIKE.
+ */
+async function keywordFallbackSearch(
+  env: Env,
+  query: string,
+  topK: number,
+  tag?: string
+): Promise<RecallMatch[]> {
+  const keywords = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2)
+    .slice(0, 8); // cap to avoid huge SQL
+
+  if (!keywords.length) return [];
+
+  const conditions = keywords.map(() => `LOWER(content) LIKE ?`);
+  let sql = `SELECT id, content, tags, source, created_at FROM entries WHERE (${conditions.join(" OR ")})`;
+  const params: (string | number)[] = keywords.map((k) => `%${k}%`);
+
+  if (tag) {
+    sql += ` AND tags LIKE ?`;
+    params.push(`%"${tag}"%`);
+  }
+
+  sql += ` ORDER BY created_at DESC LIMIT ?`;
+  params.push(topK);
+
+  const { results } = await env.DB.prepare(sql).bind(...params).all();
+
+  return (results as Record<string, unknown>[]).map((row) => ({
+    id: row.id as string,
+    score: 0,
+    metadata: {
+      content: (row.content as string).slice(0, 512),
+      parentId: row.id as string,
+      tags: safeJsonArray(row.tags),
+      source: row.source as string,
+      created_at: row.created_at as number,
+    },
+  }));
+}
+
 // ─── Duplicate detection ──────────────────────────────────────────────────────
 
 type DuplicateResult =
   | { status: "unique"; embedding: number[] }
   | { status: "blocked"; matchId: string; score: number; embedding: number[] }
-  | { status: "flagged"; matchId: string; score: number; embedding: number[] };
+  | { status: "flagged"; matchId: string; score: number; embedding: number[] }
+  | { status: "skipped"; embedding: number[] }; // Vectorize unavailable
 
 interface RecallMatch {
   id: string;
@@ -278,8 +359,17 @@ function getHalfLifeMs(tags: string[]): number {
   return 30 * 24 * 60 * 60 * 1000;
 }
 
-function rerankWithTimeDecay(matches: RecallMatch[]): RecallMatch[] {
+/**
+ * Rerank results with configurable time-decay weighting.
+ * Uses weighted sum: final = (1 - w) * semantic + w * recency
+ */
+function rerankWithTimeDecay(matches: RecallMatch[], recencyWeight: number = RECENCY_WEIGHT_DEFAULT): RecallMatch[] {
+  if (recencyWeight <= 0) {
+    return [...matches].sort((a, b) => b.score - a.score);
+  }
+
   const now = Date.now();
+  const w = Math.min(recencyWeight, 1);
 
   return matches
     .map((match) => {
@@ -289,20 +379,32 @@ function rerankWithTimeDecay(matches: RecallMatch[]): RecallMatch[] {
         ? meta.tags.filter((tag): tag is string => typeof tag === "string")
         : [];
       const ageMs = Math.max(0, now - createdAt);
-      const recencyMultiplier = Math.exp(-ageMs / getHalfLifeMs(tags));
+      const recencyScore = Math.exp(-ageMs / getHalfLifeMs(tags));
 
-      return { ...match, score: match.score * recencyMultiplier };
+      // Weighted combination: semantic relevance + time recency
+      const finalScore = (1 - w) * match.score + w * recencyScore;
+
+      return { ...match, score: finalScore };
     })
     .sort((a, b) => b.score - a.score);
 }
 
+/**
+ * Duplicate check with graceful degradation.
+ * If Vectorize fails, returns "skipped" and allows the entry to be stored.
+ */
 async function checkDuplicate(content: string, env: Env): Promise<DuplicateResult> {
   const values = await embed(getDuplicateCheckSample(content), env);
-  const results = await env.VECTORIZE.query(values, { topK: 1, returnMetadata: "all" });
 
-  if (!results.matches.length) return { status: "unique", embedding: values };
+  const { matches, degraded } = await safeVectorizeQuery(env, values, { topK: 1, returnMetadata: "all" });
 
-  const top = results.matches[0];
+  if (degraded) {
+    return { status: "skipped", embedding: values };
+  }
+
+  if (!matches.length) return { status: "unique", embedding: values };
+
+  const top = matches[0];
   const score = top.score;
   const matchId = (top.metadata as any)?.parentId ?? top.id;
 
@@ -387,8 +489,6 @@ async function storeEntry(
 }
 
 // ─── Append to existing entry ─────────────────────────────────────────────────
-// Updates D1 with the full appended content, then adds only the new addition
-// as a new Vectorize chunk pointing to the same parent ID.
 
 async function appendToEntry(
   env: Env,
@@ -402,7 +502,6 @@ async function appendToEntry(
   const separator = `\n\n[Update ${timestamp}]: `;
   const newContent = existingContent + separator + addition;
 
-  // Update full content in D1
   await env.DB.prepare(
     `UPDATE entries SET content = ? WHERE id = ?`
   ).bind(newContent, id).run();
@@ -439,15 +538,237 @@ async function appendToEntry(
   ).bind(JSON.stringify(vectorIds), id).run();
 }
 
+// ─── Memory Graph ─────────────────────────────────────────────────────────────
+
+/**
+ * Auto-create edges between a new entry and similar existing entries.
+ * Uses the already-computed embedding (no extra AI call).
+ */
+async function autoLinkEntry(env: Env, id: string, embedding: number[], now: number): Promise<number> {
+  try {
+    const results = await env.VECTORIZE.query(embedding, { topK: 4, returnMetadata: "all" });
+
+    // Filter: not self, above threshold, deduplicate by parentId
+    const seen = new Set<string>([id]);
+    const candidates = results.matches.filter((m) => {
+      const parentId = (m.metadata as any)?.parentId ?? m.id;
+      if (seen.has(parentId)) return false;
+      if (m.score < AUTO_LINK_THRESHOLD) return false;
+      seen.add(parentId);
+      return true;
+    }).slice(0, 3);
+
+    if (!candidates.length) return 0;
+
+    // Create bidirectional edges
+    const stmt = env.DB.prepare(
+      `INSERT OR IGNORE INTO edges (source_id, target_id, relation, weight, created_at) VALUES (?, ?, 'related', ?, ?)`
+    );
+    const batch = candidates.flatMap((m) => {
+      const targetId = (m.metadata as any)?.parentId ?? m.id;
+      const w = Math.round(m.score * 1000) / 1000;
+      return [
+        stmt.bind(id, targetId, w, now),
+        stmt.bind(targetId, id, w, now),
+      ];
+    });
+
+    await env.DB.batch(batch);
+    return candidates.length;
+  } catch (e) {
+    console.error("Auto-link failed (non-fatal):", e);
+    return 0;
+  }
+}
+
+/**
+ * Get connections (neighbors) of an entry, up to `depth` hops.
+ */
+async function getConnections(
+  env: Env,
+  id: string,
+  depth: number = 1
+): Promise<{ id: string; relation: string; weight: number; content: string; hop: number }[]> {
+  const visited = new Set<string>([id]);
+  const results: { id: string; relation: string; weight: number; content: string; hop: number }[] = [];
+  let currentIds = [id];
+
+  for (let hop = 1; hop <= depth; hop++) {
+    if (!currentIds.length) break;
+
+    const placeholders = currentIds.map(() => "?").join(", ");
+    const { results: edgeRows } = await env.DB.prepare(`
+      SELECT source_id, target_id, relation, weight FROM edges
+      WHERE source_id IN (${placeholders}) OR target_id IN (${placeholders})
+    `).bind(...currentIds, ...currentIds).all() as { results: Record<string, unknown>[] };
+
+    const neighborIds = new Set<string>();
+    const edgeMap = new Map<string, { relation: string; weight: number }>();
+
+    for (const row of edgeRows) {
+      const src = row.source_id as string;
+      const tgt = row.target_id as string;
+      const neighborId = currentIds.includes(src) ? tgt : src;
+
+      if (!visited.has(neighborId)) {
+        neighborIds.add(neighborId);
+        edgeMap.set(neighborId, { relation: row.relation as string, weight: row.weight as number });
+        visited.add(neighborId);
+      }
+    }
+
+    if (!neighborIds.size) break;
+
+    const nIds = [...neighborIds];
+    const nPlaceholders = nIds.map(() => "?").join(", ");
+    const { results: entryRows } = await env.DB.prepare(
+      `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${nPlaceholders})`
+    ).bind(...nIds).all() as { results: Record<string, unknown>[] };
+
+    for (const row of entryRows) {
+      const edge = edgeMap.get(row.id as string);
+      results.push({
+        id: row.id as string,
+        relation: edge?.relation ?? "related",
+        weight: edge?.weight ?? 1.0,
+        content: (row.content as string).slice(0, 200),
+        hop,
+      });
+    }
+
+    currentIds = nIds;
+  }
+
+  return results;
+}
+
+/**
+ * Expand recall seeds by following graph edges (multi-hop).
+ * Returns additional entries discovered via graph traversal.
+ */
+async function expandWithHops(
+  env: Env,
+  seeds: { parentId: string; score: number }[],
+  hops: number
+): Promise<{ id: string; score: number; hop: number }[]> {
+  if (hops <= 0 || !seeds.length) return [];
+
+  const visited = new Set<string>(seeds.map((s) => s.parentId));
+  const expanded: { id: string; score: number; hop: number }[] = [];
+  let currentLayer = seeds.map((s) => ({ id: s.parentId, score: s.score }));
+
+  for (let hop = 1; hop <= hops; hop++) {
+    if (!currentLayer.length) break;
+
+    const ids = currentLayer.map((s) => s.id);
+    const placeholders = ids.map(() => "?").join(", ");
+    const { results: edgeRows } = await env.DB.prepare(`
+      SELECT source_id, target_id, weight FROM edges
+      WHERE source_id IN (${placeholders}) OR target_id IN (${placeholders})
+    `).bind(...ids, ...ids).all() as { results: Record<string, unknown>[] };
+
+    const nextLayer: { id: string; score: number }[] = [];
+    const scoreMap = new Map(currentLayer.map((s) => [s.id, s.score]));
+
+    for (const row of edgeRows) {
+      const src = row.source_id as string;
+      const tgt = row.target_id as string;
+      const neighborId = ids.includes(src) ? tgt : src;
+      const originId = ids.includes(src) ? src : tgt;
+
+      if (visited.has(neighborId)) continue;
+      visited.add(neighborId);
+
+      const originScore = scoreMap.get(originId) ?? 0;
+      const edgeWeight = row.weight as number;
+      const hopDecay = Math.pow(0.8, hop);
+      const neighborScore = originScore * edgeWeight * hopDecay;
+
+      expanded.push({ id: neighborId, score: neighborScore, hop });
+      nextLayer.push({ id: neighborId, score: neighborScore });
+    }
+
+    currentLayer = nextLayer;
+  }
+
+  return expanded;
+}
+
+// ─── Advanced Recall: MMR ─────────────────────────────────────────────────────
+
+interface MMRCandidate {
+  id: string;
+  parentId: string;
+  score: number;
+  tags: string[];
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Maximal Marginal Relevance (MMR) for diversifying recall results.
+ *
+ * Simplified approach: instead of computing full cosine similarity between
+ * all candidate pairs (which would require raw vectors), we estimate
+ * inter-result similarity using parentId overlap and tag Jaccard similarity.
+ *
+ * MMR(d) = (1 - λ) × relevance(d) − λ × max[sim(d, d_selected)]
+ */
+function applyMMR(candidates: MMRCandidate[], lambda: number, topK: number): MMRCandidate[] {
+  if (lambda <= 0 || candidates.length <= 1) return candidates.slice(0, topK);
+
+  const selected: MMRCandidate[] = [];
+  const remaining = [...candidates].sort((a, b) => b.score - a.score);
+
+  // Pick highest-scoring candidate first
+  selected.push(remaining.shift()!);
+
+  while (selected.length < topK && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestMMR = -Infinity;
+
+    for (let i = 0; i < remaining.length; i++) {
+      const cand = remaining[i];
+      const relevance = cand.score;
+
+      // Compute max similarity to already-selected results
+      let maxSim = 0;
+      for (const sel of selected) {
+        let sim = 0;
+        if (cand.parentId === sel.parentId) {
+          sim = 0.9; // near-duplicate chunks
+        } else {
+          // Tag Jaccard similarity
+          const candTags = new Set(cand.tags);
+          const selTags = new Set(sel.tags);
+          const intersection = [...candTags].filter((t) => selTags.has(t)).length;
+          const union = new Set([...candTags, ...selTags]).size;
+          sim = union > 0 ? intersection / union : 0;
+        }
+        maxSim = Math.max(maxSim, sim);
+      }
+
+      const mmr = (1 - lambda) * relevance - lambda * maxSim;
+      if (mmr > bestMMR) {
+        bestMMR = mmr;
+        bestIdx = i;
+      }
+    }
+
+    selected.push(remaining.splice(bestIdx, 1)[0]);
+  }
+
+  return selected;
+}
+
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
 function buildMcpServer(env: Env): McpServer {
-  const server = new McpServer({ name: "second-brain", version: "1.2.0" });
+  const server = new McpServer({ name: "second-brain", version: "2.0.0" });
 
   // ── remember ────────────────────────────────────────────────────────────
   server.tool(
     "remember",
-    "Store an idea, task, or note in your second brain",
+    "Store an idea, task, or note in your second brain. Automatically links to similar existing memories.",
     {
       content: z.string().min(1).max(MAX_CONTENT_CHARS).describe("The idea, task, or note to store"),
       tags: z.array(z.string().min(1).max(MAX_TAG_CHARS)).max(MAX_TAGS).optional().describe("Optional tags for filtering"),
@@ -505,22 +826,36 @@ function buildMcpServer(env: Env): McpServer {
         `INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, ?, ?, ?, ?)`
       ).bind(id, c, JSON.stringify(finalTags), s, now, "[]").run();
 
+      let linkedCount = 0;
       try {
         await storeEntry(env, id, c, finalTags, s, now, dup.embedding);
+        // Auto-link to similar entries (Memory Graph)
+        linkedCount = await autoLinkEntry(env, id, dup.embedding, now);
       } catch (e) {
         console.error("Vectorize insert failed (non-fatal):", e);
       }
+
+      const linkedNote = linkedCount > 0 ? ` Linked to ${linkedCount} related memory(ies).` : "";
 
       if (dup.status === "flagged") {
         return {
           content: [{
             type: "text",
-            text: `Stored with ID: ${id} — note: similar entry exists (${(dup.score * 100).toFixed(0)}% match, ID: ${dup.matchId}). Tagged as duplicate-candidate.`,
+            text: `Stored with ID: ${id} — note: similar entry exists (${(dup.score * 100).toFixed(0)}% match, ID: ${dup.matchId}). Tagged as duplicate-candidate.${linkedNote}`,
           }],
         };
       }
 
-      return { content: [{ type: "text", text: `Stored. ID: ${id}` }] };
+      if (dup.status === "skipped") {
+        return {
+          content: [{
+            type: "text",
+            text: `Stored with ID: ${id} [⚠ Vectorize unavailable — duplicate check skipped]`,
+          }],
+        };
+      }
+
+      return { content: [{ type: "text", text: `Stored. ID: ${id}${linkedNote}` }] };
     }
   );
 
@@ -533,7 +868,6 @@ function buildMcpServer(env: Env): McpServer {
       addition: z.string().min(1).max(MAX_ADDITION_CHARS).describe("The new information to add to the existing entry"),
     },
     async ({ id, addition }) => {
-      // Look up the existing entry
       const row = await env.DB.prepare(
         `SELECT id, content, tags, source FROM entries WHERE id = ?`
       ).bind(id).first() as Record<string, any> | null;
@@ -576,13 +910,17 @@ function buildMcpServer(env: Env): McpServer {
   // ── recall ───────────────────────────────────────────────────────────────
   server.tool(
     "recall",
-    "Semantically search your second brain for relevant notes",
+    "Semantically search your second brain for relevant notes. Supports multi-hop graph traversal, recency weighting, diversity control, and minimum similarity filtering.",
     {
       query: z.string().min(1).max(MAX_QUERY_CHARS).describe("Natural language search query"),
       topK: z.number().int().min(1).max(20).default(5).describe("Number of results"),
       tag: z.string().min(1).max(MAX_TAG_CHARS).optional().describe("Filter by a specific tag"),
+      hops: z.number().int().min(0).max(MAX_HOPS).default(0).describe("Graph traversal depth (0 = semantic only, 1-3 = follow connections)"),
+      recency_weight: z.number().min(0).max(1).default(RECENCY_WEIGHT_DEFAULT).describe("Time-decay weight (0 = pure semantic, 1 = pure recency)"),
+      diversity: z.number().min(0).max(1).default(0).describe("MMR diversity (0 = off, 0.3-0.5 = balanced, 1 = max diversity)"),
+      min_score: z.number().min(0).max(1).default(0).describe("Minimum similarity cutoff (0 = no filter)"),
     },
-    async ({ query, topK, tag }) => {
+    async ({ query, topK, tag, hops, recency_weight, diversity, min_score }) => {
       let q: string;
       let requestedTag: string | undefined;
 
@@ -605,18 +943,60 @@ function buildMcpServer(env: Env): McpServer {
         }
       }
 
-      const queryTopK = requestedTag ? MAX_VECTORIZE_TOP_K_WITH_METADATA : Math.min(topK * 3, MAX_VECTORIZE_TOP_K_WITH_METADATA);
-      const values = await embed(q, env);
-      const results = await env.VECTORIZE.query(values, {
-        topK: queryTopK,
-        returnMetadata: "all",
-      });
+      // ── Semantic search (with graceful degradation) ──
+      const queryTopK = requestedTag
+        ? MAX_VECTORIZE_TOP_K_WITH_METADATA
+        : Math.min(topK * 3, MAX_VECTORIZE_TOP_K_WITH_METADATA);
 
-      if (!results.matches.length) {
+      let values: number[];
+      let allMatches: RecallMatch[];
+      let degraded = false;
+
+      try {
+        values = await embed(q, env);
+      } catch (e) {
+        // If embedding fails, fall back to keyword search
+        console.error("Embedding failed, falling back to keyword search:", e);
+        values = [];
+        degraded = true;
+      }
+
+      if (!degraded && values.length > 0) {
+        const result = await safeVectorizeQuery(env, values, {
+          topK: queryTopK,
+          returnMetadata: "all",
+        });
+        allMatches = result.matches;
+        degraded = result.degraded;
+      } else {
+        allMatches = [];
+        degraded = true;
+      }
+
+      // Fallback to keyword search if Vectorize failed
+      if (degraded) {
+        allMatches = await keywordFallbackSearch(env, q, topK, requestedTag);
+        if (!allMatches.length) {
+          return { content: [{ type: "text", text: "Nothing found matching that query. [⚠ Vectorize unavailable — used keyword fallback]" }] };
+        }
+      }
+
+      if (!allMatches.length) {
         return { content: [{ type: "text", text: "Nothing found matching that query." }] };
       }
 
-      const reranked = rerankWithTimeDecay(results.matches as RecallMatch[]);
+      // ── Apply similarity cutoff ──
+      if (min_score > 0 && !degraded) {
+        allMatches = allMatches.filter((m) => m.score >= min_score);
+        if (!allMatches.length) {
+          return { content: [{ type: "text", text: `Nothing found above ${(min_score * 100).toFixed(0)}% similarity threshold.` }] };
+        }
+      }
+
+      // ── Rerank with time decay ──
+      const reranked = rerankWithTimeDecay(allMatches, recency_weight);
+
+      // ── Deduplicate by parentId + tag filter ──
       const seen = new Set<string>();
       const deduped = reranked.filter((m) => {
         const parentId = (m.metadata as any)?.parentId ?? m.id;
@@ -624,20 +1004,59 @@ function buildMcpServer(env: Env): McpServer {
         if (tagFilterIds && !tagFilterIds.has(parentId)) return false;
         seen.add(parentId);
         return true;
-      }).slice(0, topK);
+      });
 
-      if (!deduped.length) {
+      // ── Apply MMR diversity ──
+      let selected: typeof deduped;
+      if (diversity > 0 && !degraded) {
+        const mmrCandidates: MMRCandidate[] = deduped.map((m) => ({
+          id: m.id,
+          parentId: ((m.metadata as any)?.parentId ?? m.id) as string,
+          score: m.score,
+          tags: Array.isArray((m.metadata as any)?.tags)
+            ? ((m.metadata as any).tags as string[])
+            : [],
+          metadata: m.metadata,
+        }));
+        const mmrResult = applyMMR(mmrCandidates, diversity, topK);
+        selected = mmrResult.map((c) => ({
+          id: c.id,
+          score: c.score,
+          metadata: c.metadata,
+        }));
+      } else {
+        selected = deduped.slice(0, topK);
+      }
+
+      if (!selected.length) {
         return { content: [{ type: "text", text: "Nothing found matching that query." }] };
       }
 
-      const parentIds = deduped.map((m) => ((m.metadata as any)?.parentId ?? m.id) as string);
-      const placeholders = parentIds.map(() => "?").join(", ");
+      // ── Multi-hop graph expansion ──
+      let hopEntries: { id: string; score: number; hop: number }[] = [];
+      if (hops > 0 && !degraded) {
+        const seeds = selected.map((m) => ({
+          parentId: ((m.metadata as any)?.parentId ?? m.id) as string,
+          score: m.score,
+        }));
+        hopEntries = await expandWithHops(env, seeds, hops);
+      }
+
+      // ── Fetch full content from D1 ──
+      const parentIds = selected.map((m) => ((m.metadata as any)?.parentId ?? m.id) as string);
+      const hopIds = hopEntries.map((h) => h.id);
+      const allIds = [...new Set([...parentIds, ...hopIds])];
+      const placeholders = allIds.map(() => "?").join(", ");
+
       const { results: d1Rows } = await env.DB.prepare(
         `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders})`
-      ).bind(...parentIds).all() as { results: Record<string, unknown>[] };
+      ).bind(...allIds).all() as { results: Record<string, unknown>[] };
       const d1Map = new Map(d1Rows.map((row) => [row.id as string, row]));
 
-      const text = deduped.map((m, i) => {
+      // ── Format seed results ──
+      const parts: string[] = [];
+
+      const seedText = selected.map((m, i) => {
         const meta = m.metadata as Record<string, any>;
         const parentId = (meta?.parentId ?? m.id) as string;
         const row = d1Map.get(parentId);
@@ -645,11 +1064,11 @@ function buildMcpServer(env: Env): McpServer {
         const updateLabel = meta?.isUpdate ? " [updated]" : "";
 
         if (row) {
-          const date = typeof row.created_at === "number" ? new Date(row.created_at).toLocaleDateString() : "?";
+          const date = typeof row.created_at === "number" ? new Date(row.created_at as number).toLocaleDateString() : "?";
           const tags = safeJsonArray(row.tags);
           const tagList = tags.length ? ` [${tags.join(", ")}]` : "";
           const src = row.source ? ` · ${row.source as string}` : "";
-          return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}\n${row.content as string}`;
+          return `${i + 1}. [${date}${src}${tagList}] (${degraded ? "keyword" : `${score}%`} match)${updateLabel}\nID: ${parentId}\n${row.content as string}`;
         }
 
         const date = meta?.created_at ? new Date(meta.created_at as number).toLocaleDateString() : "?";
@@ -659,7 +1078,102 @@ function buildMcpServer(env: Env): McpServer {
         return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${chunkLabel}${updateLabel}\n${meta?.content ?? ""}`;
       }).join("\n\n");
 
-      return { content: [{ type: "text", text }] };
+      parts.push(seedText);
+
+      // ── Format hop results (if any) ──
+      if (hopEntries.length) {
+        const hopTexts = hopEntries
+          .sort((a, b) => b.score - a.score)
+          .slice(0, topK)
+          .map((h, i) => {
+            const row = d1Map.get(h.id);
+            if (!row) return null;
+            const date = typeof row.created_at === "number" ? new Date(row.created_at as number).toLocaleDateString() : "?";
+            const tags = safeJsonArray(row.tags);
+            const tagList = tags.length ? ` [${tags.join(", ")}]` : "";
+            const src = row.source ? ` · ${row.source as string}` : "";
+            return `  ↳ ${i + 1}. [${date}${src}${tagList}] (hop ${h.hop}, ${(h.score * 100).toFixed(0)}% graph score)\n  ID: ${h.id}\n  ${(row.content as string).slice(0, 300)}${(row.content as string).length > 300 ? "..." : ""}`;
+          })
+          .filter(Boolean);
+
+        if (hopTexts.length) {
+          parts.push(`\n── Connected memories (via graph, ${hops} hop${hops > 1 ? "s" : ""}) ──\n${hopTexts.join("\n\n")}`);
+        }
+      }
+
+      if (degraded) {
+        parts.push("\n[⚠ Vectorize unavailable — results from keyword fallback]");
+      }
+
+      return { content: [{ type: "text", text: parts.join("\n") }] };
+    }
+  );
+
+  // ── link ─────────────────────────────────────────────────────────────────
+  server.tool(
+    "link",
+    "Create a connection between two memories in the knowledge graph. Links are bidirectional.",
+    {
+      source_id: z.string().describe("First entry ID"),
+      target_id: z.string().describe("Second entry ID"),
+      relation: z.enum(VALID_RELATIONS).default("related").describe("Relationship type: related, extends, contradicts, depends_on"),
+    },
+    async ({ source_id, target_id, relation }) => {
+      if (source_id === target_id) {
+        return toolText("Cannot link an entry to itself.");
+      }
+
+      // Verify both entries exist
+      const { results: rows } = await env.DB.prepare(
+        `SELECT id FROM entries WHERE id IN (?, ?)`
+      ).bind(source_id, target_id).all();
+
+      const foundIds = new Set((rows as Record<string, unknown>[]).map((r) => r.id as string));
+      if (!foundIds.has(source_id)) return toolText(`Entry not found: ${source_id}`);
+      if (!foundIds.has(target_id)) return toolText(`Entry not found: ${target_id}`);
+
+      const now = Date.now();
+      const stmt = env.DB.prepare(
+        `INSERT OR REPLACE INTO edges (source_id, target_id, relation, weight, created_at) VALUES (?, ?, ?, 1.0, ?)`
+      );
+
+      await env.DB.batch([
+        stmt.bind(source_id, target_id, relation, now),
+        stmt.bind(target_id, source_id, relation, now),
+      ]);
+
+      return toolText(`Linked ${source_id} ↔ ${target_id} (${relation})`);
+    }
+  );
+
+  // ── connections ──────────────────────────────────────────────────────────
+  server.tool(
+    "connections",
+    "Show memories connected to a given entry in the knowledge graph.",
+    {
+      id: z.string().describe("Entry ID to explore connections for"),
+      depth: z.number().int().min(1).max(MAX_CONNECTIONS_DEPTH).default(1).describe("How many hops to traverse (1 = direct, 2-3 = extended)"),
+    },
+    async ({ id, depth }) => {
+      // Verify entry exists
+      const entry = await env.DB.prepare(
+        `SELECT id, content FROM entries WHERE id = ?`
+      ).bind(id).first() as Record<string, unknown> | null;
+
+      if (!entry) return toolText(`Entry not found: ${id}`);
+
+      const conns = await getConnections(env, id, depth);
+
+      if (!conns.length) {
+        return toolText(`No connections found for entry ${id}.`);
+      }
+
+      const text = conns.map((c, i) => {
+        const hopLabel = c.hop > 1 ? ` (${c.hop} hops away)` : "";
+        return `${i + 1}. [${c.relation}, weight: ${c.weight.toFixed(2)}]${hopLabel}\n   ID: ${c.id}\n   ${c.content}`;
+      }).join("\n\n");
+
+      return toolText(`Connections for ${id} (depth ${depth}):\n\n${text}`);
     }
   );
 
@@ -704,7 +1218,7 @@ function buildMcpServer(env: Env): McpServer {
   // ── forget ───────────────────────────────────────────────────────────────
   server.tool(
     "forget",
-    "Delete an entry from your second brain by ID",
+    "Delete an entry from your second brain by ID. Also removes all graph connections.",
     { id: z.string().describe("Entry ID from recall or list_recent") },
     async ({ id }) => {
       const row = await env.DB.prepare(
@@ -712,8 +1226,21 @@ function buildMcpServer(env: Env): McpServer {
       ).bind(id).first() as Record<string, unknown> | null;
       const trackedVectorIds = safeJsonArray(row?.vector_ids);
 
+      // Delete entry from D1
       await env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind(id).run();
 
+      // Cascade: delete all edges involving this entry
+      let edgesDeleted = 0;
+      try {
+        const result = await env.DB.prepare(
+          `DELETE FROM edges WHERE source_id = ? OR target_id = ?`
+        ).bind(id, id).run();
+        edgesDeleted = result.meta?.changes ?? 0;
+      } catch (e) {
+        console.error("Edge deletion failed (non-fatal):", e);
+      }
+
+      // Delete vectors from Vectorize
       try {
         if (trackedVectorIds.length) {
           await env.VECTORIZE.deleteByIds(trackedVectorIds);
@@ -725,7 +1252,7 @@ function buildMcpServer(env: Env): McpServer {
         console.error("Vectorize delete failed (non-fatal):", e);
       }
 
-      return { content: [{ type: "text", text: `Deleted entry ${id} and ${trackedVectorIds.length} vector(s)` }] };
+      return { content: [{ type: "text", text: `Deleted entry ${id}, ${trackedVectorIds.length} vector(s), and ${edgesDeleted} edge(s)` }] };
     }
   );
 
@@ -745,6 +1272,47 @@ export default {
     ctx.waitUntil(
       ensureDatabase(env).catch((e) => console.error("Async database initialization failed:", e))
     );
+
+    // ── GET /health (no auth — for monitoring) ──
+    if (url.pathname === "/health" && request.method === "GET") {
+      const health: Record<string, unknown> = {
+        version: "2.0.0",
+        timestamp: new Date().toISOString(),
+      };
+
+      // Check D1 database
+      try {
+        await ensureDatabase(env);
+        const { results } = await env.DB.prepare("SELECT COUNT(*) as count FROM entries").all();
+        const entryCount = (results[0] as any)?.count ?? 0;
+
+        const { results: edgeResults } = await env.DB.prepare("SELECT COUNT(*) as count FROM edges").all();
+        const edgeCount = (edgeResults[0] as any)?.count ?? 0;
+
+        health.database = { ok: true, entries_count: entryCount };
+        health.graph = { ok: true, edges_count: edgeCount };
+      } catch (e) {
+        health.database = { ok: false, error: (e as Error).message };
+        health.graph = { ok: false, error: "Database unavailable" };
+      }
+
+      // Check Vectorize index
+      try {
+        const testVec = new Array(1024).fill(0);
+        testVec[0] = 1;
+        await env.VECTORIZE.query(testVec, { topK: 1 });
+        health.vectorize = { ok: true };
+      } catch (e) {
+        health.vectorize = { ok: false, error: (e as Error).message };
+      }
+
+      const dbOk = (health.database as any)?.ok === true;
+      const vecOk = (health.vectorize as any)?.ok === true;
+
+      health.status = dbOk && vecOk ? "healthy" : dbOk ? "degraded" : "error";
+
+      return json(health, dbOk ? 200 : 503);
+    }
 
     // POST /capture
     if (url.pathname === "/capture" && request.method === "POST") {
@@ -793,8 +1361,14 @@ export default {
       ).bind(id, c, JSON.stringify(finalTags), s, now, "[]").run();
 
       ctx.waitUntil(
-        storeEntry(env, id, c, finalTags, s, now, dup.embedding)
-          .catch((e) => console.error("Async embed failed:", e))
+        (async () => {
+          try {
+            await storeEntry(env, id, c, finalTags, s, now, dup.embedding);
+            await autoLinkEntry(env, id, dup.embedding, now);
+          } catch (e) {
+            console.error("Async embed/link failed:", e);
+          }
+        })()
       );
 
       if (dup.status === "flagged") {

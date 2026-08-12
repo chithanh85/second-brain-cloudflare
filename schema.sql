@@ -11,3 +11,16 @@ CREATE TABLE IF NOT EXISTS entries (
 
 CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source);
+
+-- Memory Graph: bidirectional edges between entries
+CREATE TABLE IF NOT EXISTS edges (
+  source_id   TEXT NOT NULL,
+  target_id   TEXT NOT NULL,
+  relation    TEXT NOT NULL DEFAULT 'related',  -- 'related', 'extends', 'contradicts', 'depends_on'
+  weight      REAL NOT NULL DEFAULT 1.0,        -- Edge strength (0.0 - 1.0)
+  created_at  INTEGER NOT NULL,                 -- Unix ms timestamp
+  PRIMARY KEY (source_id, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
